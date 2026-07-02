@@ -1,0 +1,1 @@
+g++ -std=c++17 -O2 -Wall -Wextra -pthread main.cpp JobQueue/TaskRegistry.cpp -o main.exe -lws2_32
