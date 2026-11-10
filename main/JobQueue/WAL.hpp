@@ -1,6 +1,7 @@
 #pragma once
 
 #include <fstream>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -16,6 +17,7 @@ public:
         : path_(std::move(path)) {}
 
     void append(const Task& task) const {
+        std::lock_guard<std::mutex> lock(mutex_);
         std::ofstream out(path_, std::ios::app);
         if (!out)
             throw std::runtime_error("failed to open WAL for append: " + path_);
@@ -27,6 +29,8 @@ public:
             << task.created_at << '\t'
             << task.retries << '\t'
             << status_to_int_(task.status) << '\n';
+        if (!out)
+            throw std::runtime_error("failed to write WAL: " + path_);
     }
 
     std::vector<Task> replay() const {
@@ -37,9 +41,13 @@ public:
         std::vector<Task> tasks;
         std::string line;
         while (std::getline(in, line)) {
-            auto task = parse_line_(line);
-            if (task.has_value())
-                tasks.push_back(std::move(task.value()));
+            try {
+                auto task = parse_line_(line);
+                if (task.has_value())
+                    tasks.push_back(std::move(task.value()));
+            } catch (const std::exception&) {
+                // A crash can leave an incomplete final record; keep valid history.
+            }
         }
         return tasks;
     }
@@ -149,4 +157,5 @@ private:
     }
 
     std::string path_;
+    mutable std::mutex mutex_;
 };

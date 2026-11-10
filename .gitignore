@@ -1,0 +1,7 @@
+# Build outputs
+*.exe
+
+# Runtime data
+*.wal
+*.log
+log.file

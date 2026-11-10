@@ -11,7 +11,7 @@ int main(int argc, char** argv) {
     uint16_t port = 9090;
     if (argc > 1) port = static_cast<uint16_t>(std::stoi(argv[1]));
 
-    JobQueueServer server(port, /*n_workers=*/4, /*max_concurrent=*/2, "log.file",true);
+    JobQueueServer server(port, /*n_workers=*/4, /*max_concurrent=*/2, "log.file");
     server.start();
     std::cout << "[server] listening on port " << server.port() << "\n";
 

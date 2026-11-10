@@ -1,7 +1,7 @@
 #pragma once
 #include <chrono>
 #include <cstdint>
-#include<random>
+#include <atomic>
 #include <sstream>
 #include <string>
 enum class TaskStatus {
@@ -46,10 +46,9 @@ struct Task {
  
 private:
     static std::string generate_id() {
-        static std::mt19937 rng{std::random_device{}()};
-        static std::uniform_int_distribution<uint32_t> dist;
+        static std::atomic<std::uint64_t> sequence{1};
         std::ostringstream oss;
-        oss << std::hex << dist(rng) << dist(rng);
+        oss << std::hex << now_ms() << '-' << sequence.fetch_add(1, std::memory_order_relaxed);
         return oss.str();
     }
  
