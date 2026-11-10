@@ -29,10 +29,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
 #include <iostream>
 #include <mutex>
 #include <random>
+#include <unordered_set>
 #include <thread>
 #include <vector>
 
@@ -44,15 +44,46 @@ static double ms_since(Clock::time_point start) {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 }
 
-int main(int argc, char** argv) {
-    int n_clients        = argc > 1 ? std::atoi(argv[1]) : 50;
-    int tasks_per_client  = argc > 2 ? std::atoi(argv[2]) : 200;
-    int n_workers         = argc > 3 ? std::atoi(argv[3]) : 8;
-    int max_concurrent    = argc > 4 ? std::atoi(argv[4]) : 16;
-    int work_ms           = argc > 5 ? std::atoi(argv[5]) : 5;
-    uint16_t port         = argc > 6 ? static_cast<uint16_t>(std::atoi(argv[6])) : 9191;
+static bool positive(int value) { return value > 0; }
 
-    long total_tasks = static_cast<long>(n_clients) * tasks_per_client;
+static void print_usage(const char* name) {
+    std::cout << "Usage: " << name
+              << " [clients] [tasks_per_client] [workers] [max_concurrent] [work_ms] [port]\n";
+}
+
+struct SubmittedTask {
+    uint64_t wire_id;
+    Clock::time_point submitted_at;
+};
+
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--help") {
+        print_usage(argv[0]);
+        return 0;
+    }
+
+    int n_clients = 50, tasks_per_client = 200, n_workers = 8;
+    int max_concurrent = 16, work_ms = 5, port_value = 9191;
+    try {
+        if (argc > 1) n_clients = std::stoi(argv[1]);
+        if (argc > 2) tasks_per_client = std::stoi(argv[2]);
+        if (argc > 3) n_workers = std::stoi(argv[3]);
+        if (argc > 4) max_concurrent = std::stoi(argv[4]);
+        if (argc > 5) work_ms = std::stoi(argv[5]);
+        if (argc > 6) port_value = std::stoi(argv[6]);
+    } catch (const std::exception&) {
+        std::cerr << "invalid numeric argument\n";
+        print_usage(argv[0]);
+        return 2;
+    }
+    if (!positive(n_clients) || !positive(tasks_per_client) || !positive(n_workers) ||
+        !positive(max_concurrent) || work_ms < 0 || port_value < 1 || port_value > 65535) {
+        std::cerr << "arguments must be positive; work_ms may be zero; port must be 1..65535\n";
+        return 2;
+    }
+    uint16_t port = static_cast<uint16_t>(port_value);
+
+    const long total_tasks = static_cast<long>(n_clients) * tasks_per_client;
 
     std::cout << "=== Stress test config ===\n"
               << "  clients:          " << n_clients << "\n"
@@ -64,7 +95,7 @@ int main(int argc, char** argv) {
               << "  port:             " << port << "\n\n";
 
     std::remove("stress.wal");  // start clean each run
-    JobQueueServer server(port, n_workers, max_concurrent, "stress.wal", /*verbose=*/false);
+    JobQueueServer server(port, n_workers, max_concurrent, "stress.wal");
     server.start();
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -73,6 +104,9 @@ int main(int argc, char** argv) {
     std::mutex latency_mutex;
     std::vector<double> latencies_ms;
     latencies_ms.reserve(static_cast<std::size_t>(total_tasks));
+    std::mutex task_mutex;
+    std::vector<SubmittedTask> submitted_tasks;
+    submitted_tasks.reserve(static_cast<std::size_t>(total_tasks));
 
     auto client_work = [&](int client_idx) {
         socket_handle fd = jobq_client::connect_to("127.0.0.1", port);
@@ -92,7 +126,10 @@ int main(int argc, char** argv) {
             auto t0 = Clock::now();
             try {
                 auto reply = jobq_client::submit(fd, priority, "stress", payload);
-                (void)reply;
+                {
+                    std::lock_guard<std::mutex> lock(task_mutex);
+                    submitted_tasks.push_back({reply.task_id, t0});
+                }
                 local_latencies.push_back(ms_since(t0));
                 ++submitted;
             } catch (...) {
@@ -125,7 +162,7 @@ int main(int argc, char** argv) {
                       << " free_slots=" << s.pool_free_slots
                       << " done=" << s.done_count
                       << " submitted=" << submitted.load() << "\n";
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     });
 
@@ -141,24 +178,60 @@ int main(int argc, char** argv) {
               << "  submit throughput:" << (submitted.load() / (submit_elapsed_ms / 1000.0))
               << " submits/sec\n\n";
 
-    // Drain: wait for WorkerPool to finish everything still in flight.
+    // Drain: wait until every task submitted by this run reaches a terminal
+    // state, then verify each returned wire ID individually.
     std::cout << "=== Draining (waiting for all tasks to finish) ===\n";
     auto drain_start = Clock::now();
     JobQueueServer::LiveStats s{};
-    for (int i = 0; i < 6000; ++i) {  // up to 10 minutes of polling, exits early normally
+    bool drain_timed_out = true;
+    for (int i = 0; i < 6000; ++i) {  // up to 10 minutes of polling
         s = server.live_stats();
-        if (static_cast<long>(s.done_count + s.failed_count) >= submitted.load()) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (static_cast<long>(s.done_count + s.failed_count) >=
+            static_cast<long>(submitted_tasks.size())) {
+            drain_timed_out = false;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     double drain_elapsed_ms = ms_since(drain_start);
-    double total_elapsed_ms = submit_elapsed_ms + drain_elapsed_ms;
+    const auto completion_observed_at = Clock::now();
+    const double end_to_end_ms =
+        std::chrono::duration<double, std::milli>(completion_observed_at - submit_phase_start).count();
+
+    socket_handle status_fd = jobq_client::connect_to("127.0.0.1", port);
+    std::unordered_set<uint64_t> unknown_ids;
+    std::size_t verified_done = 0;
+    std::size_t verified_failed = 0;
+    if (status_fd != invalid_socket_handle) {
+        for (const auto& task : submitted_tasks) {
+            try {
+                auto reply = jobq_client::status(status_fd, task.wire_id);
+                if (reply.body == "done") ++verified_done;
+                else if (reply.body == "failed") ++verified_failed;
+                else unknown_ids.insert(task.wire_id);
+            } catch (...) {
+                unknown_ids.insert(task.wire_id);
+            }
+        }
+        close_socket(status_fd);
+    } else {
+        unknown_ids.reserve(submitted_tasks.size());
+        for (const auto& task : submitted_tasks)
+            unknown_ids.insert(task.wire_id);
+    }
 
     std::cout << "  done:             " << s.done_count << "\n"
               << "  failed:           " << s.failed_count << "\n"
+              << "  dead-lettered:    " << s.dead_letter_count << "\n"
               << "  drain time:       " << drain_elapsed_ms << " ms\n"
-              << "  end-to-end time:  " << total_elapsed_ms << " ms\n"
-              << "  completion tput:  " << (s.done_count / (total_elapsed_ms / 1000.0))
+              << "  end-to-end time:  " << end_to_end_ms << " ms\n"
+              << "  verified done:    " << verified_done << "\n"
+              << "  verified failed:  " << verified_failed << "\n"
+              << "  unknown IDs:      " << unknown_ids.size() << "\n"
+              << "  completion tput:  " << (s.done_count / (end_to_end_ms / 1000.0))
               << " tasks/sec\n\n";
+    if (drain_timed_out)
+        std::cerr << "ERROR: drain timed out after 10 minutes\n";
 
     // Latency percentiles for the SUBMIT round trip itself.
     std::sort(latencies_ms.begin(), latencies_ms.end());
@@ -180,5 +253,7 @@ int main(int argc, char** argv) {
               << "  avg: " << avg << "\n";
 
     server.stop();
-    return 0;
+    return (drain_timed_out || submit_failures.load() != 0 ||
+            verified_done + verified_failed != submitted_tasks.size() ||
+            !unknown_ids.empty()) ? 1 : 0;
 }

@@ -38,6 +38,7 @@ inline const char* cmd_name(Cmd c) {
  
 static constexpr uint32_t MAGIC      = 0x4A4F4251u;  // "JOBQ"
 static constexpr std::size_t HDR_LEN = 17;            // magic(4)+cmd(1)+id(8)+len(4)
+static constexpr uint32_t MAX_BODY_LEN = 16u * 1024u * 1024u;
  
 // ── LE helpers ──
 //uint8_t 4 byte
@@ -91,6 +92,8 @@ public:
     std::optional<Frame> feed(const std::vector<uint8_t>& chunk) {
         return feed(chunk.data(), chunk.size());
     }
+
+    std::optional<Frame> next() { return try_decode(); }
  
     // Reset after a protocol error
     void reset() { buf_.clear(); }
@@ -110,6 +113,10 @@ private:
         }
  
         uint32_t blen = r32(p + 13);
+        if (blen > MAX_BODY_LEN) {
+            reset();
+            throw std::runtime_error("Protocol: body is too large");
+        }
         std::size_t total = HDR_LEN + blen;
         if (buf_.size() < total) return std::nullopt;   // incomplete
         //decode into cmd and task_id and body

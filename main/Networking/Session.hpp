@@ -1,14 +1,10 @@
 #pragma once
 #include "SocketPlatform.hpp"
-#include <atomic>
 #include <cstdint>
-#include <cstring>
 #include <functional>
-#include <mutex>
 #include <stdexcept>
 #include <string>
-#include <thread>
-#include <vector>
+#include <utility>
 #include "Protocol.hpp"
 #include "SocketUtils.hpp"
 using FrameHandler = std::function<proto::Frame(const proto::Frame&)>;
@@ -36,12 +32,14 @@ public:
 
             try {
                 auto frame = dec_.feed(buf, static_cast<std::size_t>(n));
-                if (!frame) continue; //partial frame, wait for more bytes
-                auto reply = handler_(*frame);//call into JobQueue via injected lamda
-                //what if we dont have any reply ?
-                auto wire = reply.encode();
-                //what does this send_all do ?
-                if (!send_all(fd_, wire)) break;
+                while (frame) {
+                    auto reply = handler_(*frame);
+                    if (!send_all(fd_, reply.encode())) {
+                        alive_ = false;
+                        break;
+                    }
+                    frame = dec_.next();
+                }
             } catch (const std::exception& e) {
                 proto::Frame err;
                 err.cmd = proto::Cmd::ERROR;
